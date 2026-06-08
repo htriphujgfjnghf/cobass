@@ -1,4 +1,4 @@
-name: 🔁 Jalankan Perintah di Semua Space (Banyak Akun)
+name: 🔁 Jalankan Perintah di Semua Space (Banyak Akun, Skip Jika Running)
 
 on:
   workflow_dispatch:
@@ -13,11 +13,12 @@ jobs:
     strategy:
       matrix:
         account:
-          - id: "acc1"          # ubah sesuai namamu
-            secret_key: "HF_TOKEN_ACC1"
-          - id: "acc2"
+          - id: "akun1"               # label bebas
+            secret_key: "HF_TOKEN_ACC1"   # nama secret di GitHub
+          - id: "akun2"
             secret_key: "HF_TOKEN_ACC2"
-          # tambahkan akun lain sesuai kebutuhan
+          # tambahkan baris lain sesuai jumlah akun
+
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,11 +37,11 @@ jobs:
 
           HF_TOKEN = os.environ["HF_TOKEN"]
           COMMAND = os.environ["COMMAND"]
-          JUPYTER_TOKEN = "huggingface"   # kosong jika Jupyter tanpa token, atau isi dari env nanti
+          JUPYTER_TOKEN = "huggingface"   # kosongkan jika Jupyter sudah tidak pakai token
 
           api = HfApi(token=HF_TOKEN)
 
-          # Dapatkan username dari token
+          # 1. Dapatkan username dari token
           try:
               user = api.whoami()
               username = user["name"]
@@ -49,7 +50,7 @@ jobs:
               print(f"❌ Gagal mendapatkan username: {e}")
               sys.exit(1)
 
-          # Ambil semua Space (private/public)
+          # 2. Ambil semua Space milik akun
           all_spaces = []
           try:
               for space in api.list_spaces(author=username):
@@ -66,30 +67,35 @@ jobs:
           for s in all_spaces:
               print(f"   - {s}")
 
-          # Proses setiap Space
+          # 3. Proses setiap Space
           for repo_id in all_spaces:
               print(f"\n{'='*50}")
               print(f"🔧 Memproses: {repo_id}")
               try:
-                  # 1. Cek status & restart jika tidak running
+                  # --- CEK STATUS ---
                   runtime = api.get_space_runtime(repo_id)
                   stage = str(runtime.stage)
-                  print(f"   Status awal: {stage}")
-                  if stage != "RUNNING":
-                      print("🔄 Me-restart Space...")
-                      api.restart_space(repo_id)
-                      for _ in range(60):
-                          time.sleep(10)
-                          runtime = api.get_space_runtime(repo_id)
-                          stage = str(runtime.stage)
-                          print(f"   Status: {stage}")
-                          if stage == "RUNNING":
-                              break
-                      else:
-                          print("⏰ Timeout menunggu running. Lewati.")
-                          continue
+                  print(f"   Status: {stage}")
 
-                  # 2. Akses JupyterLab & buat terminal
+                  if stage == "RUNNING":
+                      print("✅ Space sudah RUNNING, skip.")
+                      continue   # langsung ke Space berikutnya
+
+                  # --- RESTART & TUNGGU ---
+                  print("🔄 Me-restart Space...")
+                  api.restart_space(repo_id)
+                  for _ in range(60):   # max 10 menit
+                      time.sleep(10)
+                      runtime = api.get_space_runtime(repo_id)
+                      stage = str(runtime.stage)
+                      print(f"   Status: {stage}")
+                      if stage == "RUNNING":
+                          break
+                  else:
+                      print("⏰ Timeout menunggu running. Lewati.")
+                      continue
+
+                  # --- AKSES JUPYTERLAB & BUAT TERMINAL ---
                   space_url = f"https://{repo_id.replace('/', '-')}.hf.space"
                   headers = {"Authorization": f"Bearer {HF_TOKEN}"}
                   terminals_url = f"{space_url}/api/terminals"
@@ -104,17 +110,18 @@ jobs:
                   term_name = resp.json()["name"]
                   print(f"💻 Terminal dibuat: {term_name}")
 
-                  # 3. Kirim perintah lewat WebSocket
+                  # --- KIRIM PERINTAH VIA WEBSOCKET ---
                   ws_url = f"wss://{repo_id.replace('/', '-')}.hf.space/api/terminals/websocket/{term_name}"
-                  params = []
                   if JUPYTER_TOKEN:
-                      params.append(f"token={JUPYTER_TOKEN}")
-                  params.append(f"authorization=Bearer {HF_TOKEN}")
-                  ws_url += "?" + "&".join(params)
+                      ws_url += f"?token={JUPYTER_TOKEN}"
 
-                  ws = websocket.create_connection(ws_url)
+                  # Kirim header Authorization agar WebSocket handshake diterima
+                  ws = websocket.create_connection(
+                      ws_url,
+                      header={"Authorization": f"Bearer {HF_TOKEN}"}
+                  )
                   ws.send(json.dumps(["stdin", COMMAND + "\n"]))
-                  time.sleep(2)
+                  time.sleep(2)   # tunggu output
 
                   output = ""
                   while True:
@@ -128,7 +135,7 @@ jobs:
                   print("📤 Output:")
                   print(output.strip() or "(tidak ada output)")
 
-                  # 4. Hapus terminal
+                  # --- HAPUS TERMINAL ---
                   requests.delete(terminals_url + f"/{term_name}", headers=headers)
                   print("✅ Selesai.\n")
 
