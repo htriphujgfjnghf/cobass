@@ -1,4 +1,4 @@
-name: 🔁 Jalankan Perintah di Semua Space (Banyak Akun)
+name: 🎭 Playwright - Jalankan Perintah di JupyterLab
 
 on:
   workflow_dispatch:
@@ -7,216 +7,301 @@ on:
         description: 'Perintah yang dijalankan di terminal JupyterLab'
         required: false
         default: 'lscpu'
+      jupyter_token:
+        description: 'Token login JupyterLab (default: huggingface)'
+        required: false
+        default: 'huggingface'
 
 jobs:
   run-per-account:
     strategy:
+      fail-fast: false
       matrix:
         account:
           - id: "acc1"
             secret_key: "HF_TOKEN_ACC1"
-            jupyter_token_key: "huggingface"
           - id: "acc2"
             secret_key: "HF_TOKEN_ACC2"
-            jupyter_token_key: "huggingface"
+          # tambah akun lain sesuai kebutuhan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: pip install huggingface_hub requests websocket-client
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
 
-      - name: Proses Akun ${{ matrix.account.id }}
+      - name: Install Playwright + Chromium
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium --with-deps
+
+      - name: Buat script Playwright
+        run: |
+          cat > run_jupyter.mjs << 'SCRIPT_END'
+          import { chromium } from 'playwright';
+
+          const HF_TOKEN     = process.env.HF_TOKEN;
+          const COMMAND      = process.env.COMMAND      || 'lscpu';
+          const JUPYTER_TOKEN = process.env.JUPYTER_TOKEN || 'huggingface';
+
+          // ─── HF REST helpers ──────────────────────────────────────────────
+
+          async function hfGet(path) {
+            const r = await fetch(`https://huggingface.co${path}`, {
+              headers: { Authorization: `Bearer ${HF_TOKEN}` },
+            });
+            if (!r.ok) throw new Error(`HF API ${path} => HTTP ${r.status}`);
+            return r.json();
+          }
+
+          async function hfPost(path) {
+            const r = await fetch(`https://huggingface.co${path}`, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${HF_TOKEN}` },
+            });
+            return r.ok;
+          }
+
+          async function getUsername() {
+            const data = await hfGet('/api/whoami-v2');
+            return data.name;
+          }
+
+          async function listSpaces(username) {
+            const data = await hfGet(`/api/spaces?author=${username}&limit=200`);
+            return data.map(s => s.id);
+          }
+
+          async function getStage(repoId) {
+            const data = await hfGet(`/api/spaces/${repoId}/runtime`);
+            return data.stage;
+          }
+
+          async function restartSpace(repoId) {
+            await hfPost(`/api/spaces/${repoId}/restart`);
+          }
+
+          async function waitForRunning(repoId, timeoutMs = 600_000) {
+            const deadline = Date.now() + timeoutMs;
+            while (Date.now() < deadline) {
+              const stage = await getStage(repoId);
+              console.log(`   Status: ${stage}`);
+              if (stage === 'RUNNING') return true;
+              await sleep(10_000);
+            }
+            return false;
+          }
+
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          // ─── Playwright helpers ───────────────────────────────────────────
+
+          /**
+           * Login ke JupyterLab jika halaman login muncul.
+           * Halaman login punya input[name="password"] dan button#login_submit.
+           */
+          async function loginIfNeeded(page) {
+            // Tunggu sebentar agar halaman stabil
+            await page.waitForTimeout(3000);
+
+            const pwInput = page.locator('input[name="password"], input#password_input, input[type="password"]');
+            const isLoginPage = await pwInput.isVisible({ timeout: 8000 }).catch(() => false);
+
+            if (isLoginPage) {
+              console.log('   🔑 Halaman login ditemukan → memasukkan token...');
+              await pwInput.fill(JUPYTER_TOKEN);
+              // Klik tombol Log in
+              await page.click('button#login_submit, button[type="submit"], .btn-jupyter');
+              // Tunggu redirect ke JupyterLab
+              await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 30_000 });
+              console.log('   ✅ Login berhasil');
+            } else {
+              console.log('   ℹ️  Tidak ada halaman login (langsung masuk JupyterLab)');
+            }
+          }
+
+          /**
+           * Tunggu JupyterLab selesai loading (Launcher atau panel utama muncul).
+           */
+          async function waitForJupyterLab(page) {
+            await page.waitForSelector(
+              '#jp-main-dock-panel, .jp-Launcher, .jp-NotebookPanel',
+              { timeout: 90_000 }
+            );
+            // Beri waktu JupyterLab inisialisasi penuh
+            await page.waitForTimeout(3000);
+          }
+
+          /**
+           * Buka terminal baru di JupyterLab.
+           * Coba via Launcher tile dulu, fallback ke menu File → New → Terminal.
+           */
+          async function openTerminal(page) {
+            // Coba klik tile "Terminal" di Launcher
+            const tile = page.locator('.jp-LauncherCard-label:has-text("Terminal"), .jp-Launcher text=Terminal').first();
+            const tileVisible = await tile.isVisible({ timeout: 5000 }).catch(() => false);
+
+            if (tileVisible) {
+              await tile.click();
+              console.log('   💻 Terminal dibuka via Launcher');
+            } else {
+              // Fallback: File → New → Terminal
+              console.log('   🗂️  Tile tidak terlihat, coba via menu File...');
+              await page.click('.jp-MenuBar-itemLabel >> text=File');
+              await page.waitForTimeout(500);
+              await page.click('.lm-Menu-itemLabel >> text=New');
+              await page.waitForTimeout(500);
+              await page.click('.lm-Menu-itemLabel >> text=Terminal');
+              console.log('   💻 Terminal dibuka via menu File → New → Terminal');
+            }
+
+            // Tunggu terminal siap
+            await page.waitForSelector('.jp-Terminal-body, .xterm-helper-textarea', { timeout: 30_000 });
+            await page.waitForTimeout(2000);
+          }
+
+          /**
+           * Ketik perintah di terminal dan ambil output-nya.
+           */
+          async function runCommand(page, command) {
+            // Klik ke area terminal agar fokus
+            const termBody = page.locator('.jp-Terminal-body, .xterm-helper-textarea').first();
+            await termBody.click();
+
+            // Ketik perintah
+            await page.keyboard.type(command);
+            await page.keyboard.press('Enter');
+
+            // Tunggu perintah selesai (sederhana: tunggu 6 detik)
+            await page.waitForTimeout(6000);
+
+            // Ambil output dari DOM terminal (xterm.js DOM mode)
+            const output = await page.evaluate(() => {
+              // xterm.js merender baris sebagai <div> di dalam .xterm-rows
+              const rows = document.querySelectorAll('.xterm-rows > div');
+              if (rows.length > 0) {
+                return Array.from(rows).map(r => r.innerText || r.textContent).join('\n');
+              }
+              // Fallback: ambil semua teks dari .jp-Terminal-body
+              const body = document.querySelector('.jp-Terminal-body');
+              return body ? body.innerText : '';
+            });
+
+            return output;
+          }
+
+          // ─── Main ─────────────────────────────────────────────────────────
+
+          (async () => {
+            let username;
+            try {
+              username = await getUsername();
+              console.log(`👤 Username: ${username}`);
+            } catch (e) {
+              console.error(`❌ Gagal get username: ${e.message}`);
+              process.exit(1);
+            }
+
+            let spaces;
+            try {
+              spaces = await listSpaces(username);
+              console.log(`📋 ${spaces.length} Space ditemukan:`);
+              spaces.forEach(s => console.log(`   - ${s}`));
+            } catch (e) {
+              console.error(`❌ Gagal list spaces: ${e.message}`);
+              process.exit(1);
+            }
+
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox'],
+            });
+
+            for (const repoId of spaces) {
+              console.log(`\n${'='.repeat(50)}`);
+              console.log(`🔧 Memproses: ${repoId}`);
+
+              const page = await browser.newPage();
+              // Tangkap error konsol browser untuk debugging
+              page.on('console', msg => {
+                if (msg.type() === 'error') console.log(`   [browser error] ${msg.text()}`);
+              });
+
+              try {
+                // 1. Pastikan Space RUNNING
+                let stage = await getStage(repoId);
+                console.log(`   Status awal: ${stage}`);
+
+                if (stage !== 'RUNNING') {
+                  console.log('🔄 Me-restart Space...');
+                  await restartSpace(repoId);
+                  const ok = await waitForRunning(repoId);
+                  if (!ok) {
+                    console.log('⏰ Timeout menunggu Space running. Lewati.');
+                    continue;
+                  }
+                  console.log('   ⏳ Menunggu 20 detik agar Space stabil...');
+                  await sleep(20_000);
+                }
+
+                // 2. Buka Space di Playwright
+                const spaceUrl = `https://${repoId.replace('/', '-')}.hf.space`;
+                console.log(`   🌐 Membuka: ${spaceUrl}`);
+
+                await page.goto(spaceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+
+                // 3. Login jika diperlukan
+                await loginIfNeeded(page);
+
+                // 4. Tunggu JupyterLab siap
+                console.log('   ⏳ Menunggu JupyterLab...');
+                await waitForJupyterLab(page);
+                console.log('   ✅ JupyterLab siap');
+
+                // 5. Buka terminal
+                await openTerminal(page);
+
+                // 6. Jalankan perintah
+                console.log(`   ▶️  Menjalankan: ${COMMAND}`);
+                const output = await runCommand(page, COMMAND);
+
+                console.log('📤 Output:');
+                console.log(output.trim() || '(tidak ada output)');
+
+                // Screenshot untuk debugging (opsional, lihat di artifacts)
+                await page.screenshot({ path: `screenshot_${repoId.replace('/', '_')}.png` });
+                console.log(`   📸 Screenshot disimpan`);
+
+                console.log('✅ Selesai');
+
+              } catch (e) {
+                console.log(`❌ Gagal di ${repoId}: ${e.message}`);
+                // Screenshot saat error
+                await page.screenshot({ path: `error_${repoId.replace('/', '_')}.png` }).catch(() => {});
+              } finally {
+                await page.close();
+              }
+            }
+
+            await browser.close();
+            console.log(`\n🎉 Akun ${username} selesai diproses.`);
+          })();
+          SCRIPT_END
+
+      - name: Jalankan Playwright - Akun ${{ matrix.account.id }}
         env:
           HF_TOKEN: ${{ secrets[matrix.account.secret_key] }}
-          JUPYTER_TOKEN: ${{ secrets[matrix.account.jupyter_token_key] }}
           COMMAND: ${{ github.event.inputs.command }}
-        shell: python
-        run: |
-          import os, sys, time, json, requests, websocket
-          from huggingface_hub import HfApi
+          JUPYTER_TOKEN: ${{ github.event.inputs.jupyter_token }}
+        run: node run_jupyter.mjs
 
-          HF_TOKEN = os.environ["HF_TOKEN"]
-          JUPYTER_TOKEN = os.environ.get("huggingface", "huggingface")
-          COMMAND = os.environ["COMMAND"]
-
-          api = HfApi(token=HF_TOKEN)
-
-          # Dapatkan username dari token
-          try:
-              user = api.whoami()
-              username = user["name"]
-              print(f"👤 Username: {username}")
-          except Exception as e:
-              print(f"❌ Gagal mendapatkan username: {e}")
-              sys.exit(1)
-
-          # Ambil semua Space
-          all_spaces = []
-          try:
-              for space in api.list_spaces(author=username):
-                  all_spaces.append(space.id)
-          except Exception as e:
-              print(f"❌ Gagal mengambil daftar Space: {e}")
-              sys.exit(1)
-
-          if not all_spaces:
-              print("📭 Tidak ada Space ditemukan.")
-              sys.exit(0)
-
-          print(f"📋 Space yang akan diproses ({len(all_spaces)}):")
-          for s in all_spaces:
-              print(f"   - {s}")
-
-          def build_headers():
-              return {"Authorization": f"Bearer {HF_TOKEN}"}
-
-          def build_terminals_url(space_url):
-              url = f"{space_url}/api/terminals"
-              if JUPYTER_TOKEN:
-                  url += f"?token={JUPYTER_TOKEN}"
-              return url
-
-          def wait_for_jupyterlab(space_url, max_retries=12, wait_sec=10):
-              """
-              Coba akses JupyterLab sampai berhasil.
-              Space bisa berstatus RUNNING tapi JupyterLab masih inisialisasi.
-              """
-              headers = build_headers()
-              terminals_url = build_terminals_url(space_url)
-              for attempt in range(max_retries):
-                  try:
-                      resp = requests.get(
-                          f"{space_url}/api/kernelspecs",
-                          headers=headers,
-                          timeout=15
-                      )
-                      if resp.status_code == 200:
-                          print(f"   ✅ JupyterLab siap (percobaan {attempt + 1})")
-                          return True
-                      else:
-                          print(f"   ⏳ JupyterLab belum siap (HTTP {resp.status_code}), tunggu {wait_sec}s...")
-                  except Exception as e:
-                      print(f"   ⏳ JupyterLab belum bisa diakses ({e}), tunggu {wait_sec}s...")
-                  time.sleep(wait_sec)
-              return False
-
-          def create_terminal(space_url):
-              headers = build_headers()
-              terminals_url = build_terminals_url(space_url)
-              resp = requests.post(terminals_url, headers=headers, timeout=30)
-              if resp.status_code != 200:
-                  raise Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
-              return resp.json()["name"]
-
-          def run_command_in_terminal(space_url, term_name):
-              ws_url = f"wss://{space_url.replace('https://', '')}/api/terminals/websocket/{term_name}"
-              params = []
-              if JUPYTER_TOKEN:
-                  params.append(f"token={JUPYTER_TOKEN}")
-              params.append(f"authorization=Bearer%20{HF_TOKEN}")
-              if params:
-                  ws_url += "?" + "&".join(params)
-
-              ws = websocket.create_connection(ws_url, timeout=30)
-
-              # Tunggu terminal siap (prompt muncul)
-              time.sleep(3)
-
-              # Kirim perintah
-              ws.send(json.dumps(["stdin", COMMAND + "\n"]))
-
-              # Tunggu output
-              time.sleep(5)
-
-              output = ""
-              ws.settimeout(5)
-              while True:
-                  try:
-                      data = json.loads(ws.recv())
-                      if data[0] == "stdout":
-                          output += data[1]
-                  except websocket.WebSocketTimeoutException:
-                      break
-                  except Exception:
-                      break
-              ws.close()
-              return output
-
-          def delete_terminal(space_url, term_name):
-              headers = build_headers()
-              terminals_url = build_terminals_url(space_url)
-              base_url = terminals_url.split("?")[0]
-              requests.delete(f"{base_url}/{term_name}", headers=headers, timeout=15)
-
-          # Proses setiap Space
-          for repo_id in all_spaces:
-              print(f"\n{'='*50}")
-              print(f"🔧 Memproses: {repo_id}")
-              try:
-                  # 1. Cek status & restart jika tidak running
-                  runtime = api.get_space_runtime(repo_id)
-                  stage = str(runtime.stage)
-                  print(f"   Status awal: {stage}")
-
-                  if stage != "RUNNING":
-                      print("🔄 Me-restart Space...")
-                      api.restart_space(repo_id)
-                      space_became_running = False
-                      for attempt in range(60):
-                          time.sleep(10)
-                          runtime = api.get_space_runtime(repo_id)
-                          stage = str(runtime.stage)
-                          print(f"   Status: {stage}")
-                          if stage == "RUNNING":
-                              space_became_running = True
-                              break
-                      if not space_became_running:
-                          print("⏰ Timeout menunggu Space running. Lewati.")
-                          continue
-                      # Tambahan jeda agar proses internal Space stabil
-                      print("   ⏳ Menunggu 20 detik agar Space stabil setelah running...")
-                      time.sleep(20)
-                  else:
-                      # Space sudah running, tetap tunggu sebentar jika baru saja start
-                      print("   Space sudah RUNNING.")
-
-                  # 2. Tunggu JupyterLab benar-benar siap
-                  space_url = f"https://{repo_id.replace('/', '-')}.hf.space"
-                  print(f"   🌐 URL Space: {space_url}")
-
-                  jupyterlab_ready = wait_for_jupyterlab(space_url)
-                  if not jupyterlab_ready:
-                      print(f"⚠️  JupyterLab tidak siap setelah menunggu. Lewati.")
-                      continue
-
-                  # 3. Buat terminal
-                  try:
-                      term_name = create_terminal(space_url)
-                      print(f"💻 Terminal dibuat: {term_name}")
-                  except Exception as e:
-                      print(f"⚠️  Gagal membuat terminal: {e}. Lewati.")
-                      continue
-
-                  # 4. Jalankan perintah lewat WebSocket
-                  try:
-                      output = run_command_in_terminal(space_url, term_name)
-                      print("📤 Output:")
-                      print(output.strip() or "(tidak ada output)")
-                  except Exception as e:
-                      print(f"⚠️  Gagal menjalankan perintah: {e}")
-                  finally:
-                      # 5. Hapus terminal (selalu dijalankan)
-                      try:
-                          delete_terminal(space_url, term_name)
-                          print("🗑️  Terminal dihapus.")
-                      except Exception:
-                          pass
-
-                  print("✅ Selesai.\n")
-
-              except Exception as e:
-                  print(f"❌ Gagal di {repo_id}: {e}")
-                  continue
-
-          print(f"\n🎉 Akun {username} selesai diproses.")
+      - name: Upload screenshots (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ matrix.account.id }}
+          path: "*.png"
+          if-no-files-found: ignore
