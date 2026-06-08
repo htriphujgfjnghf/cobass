@@ -100,48 +100,61 @@ jobs:
             const page = await context.newPage();
             try {
               console.log('🌐 Membuka halaman login HuggingFace...');
+
+              // Buka halaman login — tunggu sampai networkidle agar form benar-benar muncul
               await page.goto('https://huggingface.co/login', {
-                waitUntil: 'domcontentloaded',
-                timeout: 30_000,
+                waitUntil: 'networkidle',
+                timeout: 45_000,
               });
 
-              // Screenshot halaman login untuk debug
               await page.screenshot({ path: 'debug_hf_login.png' });
+              console.log(`   📄 URL: ${page.url()} | Judul: ${await page.title()}`);
 
-              // Isi username/email
-              await page.locator('input[name="username"], input#user-signin-username, input[type="email"], input[type="text"]')
-                .first()
-                .fill(HF_EMAIL);
+              // Isi username — coba beberapa selector HF pernah pakai
+              const userInput = page.locator([
+                'input[name="username"]',
+                'input#user-signin-username',
+                'input[autocomplete="username"]',
+                'input[type="email"]',
+              ].join(', ')).first();
+              await userInput.waitFor({ timeout: 15_000 });
+              await userInput.fill(HF_EMAIL);
+              console.log('   ✏️  Email/username diisi');
 
               // Isi password
-              await page.locator('input[name="password"], input#user-signin-password, input[type="password"]')
-                .first()
-                .fill(HF_PASSWORD);
+              const pwInput = page.locator([
+                'input[name="password"]',
+                'input#user-signin-password',
+                'input[type="password"]',
+              ].join(', ')).first();
+              await pwInput.fill(HF_PASSWORD);
+              console.log('   ✏️  Password diisi');
 
-              // Screenshot setelah isi form
               await page.screenshot({ path: 'debug_hf_login_filled.png' });
 
-              // Klik tombol login
-              await page.locator('button[type="submit"]').first().click();
-
-              // Tunggu redirect setelah login berhasil
-              // HF redirect ke / atau /username setelah sukses
-              await page.waitForURL(
-                url => !url.toString().includes('/login'),
-                { timeout: 30_000 }
-              );
+              // FIX UTAMA: klik submit + waitForNavigation harus bersamaan (Promise.all)
+              // Jika dilakukan terpisah, navigasi bisa kelewatan dan timeout
+              console.log('   🖱️  Klik tombol login...');
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'networkidle', timeout: 45_000 }),
+                page.locator('button[type="submit"]').first().click(),
+              ]);
 
               const afterUrl = page.url();
               const title    = await page.title();
-              console.log(`✅ Login HF berhasil! URL sekarang: ${afterUrl}`);
-              console.log(`   Judul: ${title}`);
+              console.log(`   📄 Setelah login → URL: ${afterUrl}`);
+              console.log(`   📝 Judul: ${title}`);
+              await page.screenshot({ path: 'debug_hf_login_after.png' });
 
-              await page.screenshot({ path: 'debug_hf_login_success.png' });
-
-              // Verifikasi — pastikan tidak balik ke login page (gagal login)
+              // Cek apakah masih di /login → berarti gagal (salah kredensial / CAPTCHA)
               if (afterUrl.includes('/login')) {
-                throw new Error('Login gagal — kemungkinan email/password salah');
+                // Cari pesan error di halaman
+                const errMsg = await page.locator('.error, .alert-danger, [class*="error"], [class*="alert"]')
+                  .first().textContent().catch(() => '');
+                throw new Error(`Login gagal${errMsg ? ': ' + errMsg.trim() : ' — cek email/password di GitHub Secrets'}`);
               }
+
+              console.log('✅ Login HF berhasil!');
 
             } finally {
               await page.close();
