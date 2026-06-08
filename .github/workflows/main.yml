@@ -14,7 +14,7 @@ on:
 
 env:
   HF_TOKEN: ${{ secrets.HF_TOKEN }}
-  JUPYTER_TOKEN: ''                         # isi jika Jupyter pakai token, misal dari env Space
+  JUPYTER_TOKEN: 'huggingface'                         # isi jika Jupyter pakai token, misal dari env Space
   COMMAND_TO_RUN: ${{ github.event.inputs.command }}
   SPACE_NAME_INPUT: ${{ github.event.inputs.space_name }}
 
