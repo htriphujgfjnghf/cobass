@@ -1,4 +1,4 @@
-name: 🎭 Playwright - Login HF + Jalankan Perintah di JupyterLab
+name: 🎭 Playwright - Jalankan Perintah di JupyterLab
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: false
         default: 'lscpu'
       jupyter_token:
-        description: 'Token login JupyterLab (default: huggingface)'
+        description: 'Token JupyterLab (default: huggingface)'
         required: false
         default: 'huggingface'
 
@@ -19,14 +19,9 @@ jobs:
       matrix:
         account:
           - id: "acc1"
-            hf_token_key:    "HF_TOKEN_ACC1"
-            hf_email_key:    "HF_EMAIL_ACC1"
-            hf_password_key: "HF_PASSWORD_ACC1"
+            hf_token_key: "HF_TOKEN_ACC1"
           - id: "acc2"
-            hf_token_key:    "HF_TOKEN_ACC2"
-            hf_email_key:    "HF_EMAIL_ACC2"
-            hf_password_key: "HF_PASSWORD_ACC2"
-          # tambah akun lain sesuai kebutuhan
+            hf_token_key: "HF_TOKEN_ACC2"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,18 +43,18 @@ jobs:
           import { chromium } from 'playwright';
 
           const HF_TOKEN      = process.env.HF_TOKEN;
-          const HF_EMAIL      = process.env.HF_EMAIL;
-          const HF_PASSWORD   = process.env.HF_PASSWORD;
           const COMMAND       = process.env.COMMAND       || 'lscpu';
           const JUPYTER_TOKEN = process.env.JUPYTER_TOKEN || 'huggingface';
 
-          // ─── HF REST API helpers (pakai token, untuk list/restart Space) ──
+          const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+          // ─── HF REST API (list spaces & restart) ─────────────────────────
 
           async function hfGet(path) {
             const r = await fetch(`https://huggingface.co${path}`, {
               headers: { Authorization: `Bearer ${HF_TOKEN}` },
             });
-            if (!r.ok) throw new Error(`HF API ${path} => HTTP ${r.status}`);
+            if (!r.ok) throw new Error(`HF API ${path} → HTTP ${r.status}`);
             return r.json();
           }
 
@@ -87,292 +82,167 @@ jobs:
             return false;
           }
 
-          const sleep = ms => new Promise(r => setTimeout(r, ms));
+          // ─── Playwright: akses JupyterLab langsung via URL+token ─────────
 
-          // ─── LOGIN ke Hugging Face via browser ────────────────────────────
+          async function processSpace(browser, repoId) {
+            // URL lowercase + tambah token langsung di URL → bypass form login
+            const base     = `https://${repoId.replace('/', '-').toLowerCase()}.hf.space`;
+            const labUrl   = `${base}/lab?token=${JUPYTER_TOKEN}`;
+            const safeId   = repoId.replace('/', '_');
 
-          /**
-           * Login ke huggingface.co menggunakan email + password.
-           * Setelah ini, semua cookie auth tersimpan di browser context,
-           * jadi bisa akses Space private tanpa perlu token lagi.
-           */
-          async function loginToHuggingFace(context) {
+            // Context baru per Space (cookie terisolasi)
+            const context = await browser.newContext({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              extraHTTPHeaders: {
+                // Kirim HF token di setiap request ke hf.space
+                Authorization: `Bearer ${HF_TOKEN}`,
+              },
+            });
+
             const page = await context.newPage();
-            try {
-              console.log('🌐 Membuka halaman login HuggingFace...');
-
-              // Buka halaman login — tunggu sampai networkidle agar form benar-benar muncul
-              await page.goto('https://huggingface.co/login', {
-                waitUntil: 'networkidle',
-                timeout: 45_000,
-              });
-
-              await page.screenshot({ path: 'debug_hf_login.png' });
-              console.log(`   📄 URL: ${page.url()} | Judul: ${await page.title()}`);
-
-              // Isi username — coba beberapa selector HF pernah pakai
-              const userInput = page.locator([
-                'input[name="username"]',
-                'input#user-signin-username',
-                'input[autocomplete="username"]',
-                'input[type="email"]',
-              ].join(', ')).first();
-              await userInput.waitFor({ timeout: 15_000 });
-              await userInput.fill(HF_EMAIL);
-              console.log('   ✏️  Email/username diisi');
-
-              // Isi password
-              const pwInput = page.locator([
-                'input[name="password"]',
-                'input#user-signin-password',
-                'input[type="password"]',
-              ].join(', ')).first();
-              await pwInput.fill(HF_PASSWORD);
-              console.log('   ✏️  Password diisi');
-
-              await page.screenshot({ path: 'debug_hf_login_filled.png' });
-
-              // FIX UTAMA: klik submit + waitForNavigation harus bersamaan (Promise.all)
-              // Jika dilakukan terpisah, navigasi bisa kelewatan dan timeout
-              console.log('   🖱️  Klik tombol login...');
-              await Promise.all([
-                page.waitForNavigation({ waitUntil: 'networkidle', timeout: 45_000 }),
-                page.locator('button[type="submit"]').first().click(),
-              ]);
-
-              const afterUrl = page.url();
-              const title    = await page.title();
-              console.log(`   📄 Setelah login → URL: ${afterUrl}`);
-              console.log(`   📝 Judul: ${title}`);
-              await page.screenshot({ path: 'debug_hf_login_after.png' });
-
-              // Cek apakah masih di /login → berarti gagal (salah kredensial / CAPTCHA)
-              if (afterUrl.includes('/login')) {
-                // Cari pesan error di halaman
-                const errMsg = await page.locator('.error, .alert-danger, [class*="error"], [class*="alert"]')
-                  .first().textContent().catch(() => '');
-                throw new Error(`Login gagal${errMsg ? ': ' + errMsg.trim() : ' — cek email/password di GitHub Secrets'}`);
-              }
-
-              console.log('✅ Login HF berhasil!');
-
-            } finally {
-              await page.close();
-            }
-          }
-
-          // ─── JupyterLab helpers ───────────────────────────────────────────
-
-          /**
-           * Buka Space URL dan handle login JupyterLab jika muncul.
-           * Karena sudah login HF, tidak akan redirect ke HF login lagi.
-           */
-          async function openSpace(context, spaceUrl) {
-            const page = await context.newPage();
-
             page.on('console', msg => {
               if (msg.type() === 'error') {
-                const txt = msg.text();
-                // Filter error 404 biasa (aset JupyterLab) agar tidak berisik
-                if (!txt.includes('favicon') && !txt.includes('.map')) {
-                  console.log(`   [browser] ${txt.substring(0, 100)}`);
-                }
+                const t = msg.text();
+                if (!t.includes('favicon') && !t.includes('.map') && !t.includes('404'))
+                  console.log(`   [browser] ${t.substring(0, 120)}`);
               }
             });
 
-            console.log(`   🌐 Membuka: ${spaceUrl}`);
-            await page.goto(spaceUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-            await page.waitForTimeout(3000);
+            try {
+              // ── 1. Buka JupyterLab langsung dengan token di URL ──────────
+              // Contoh: https://ones010-fxdgbxdfs.hf.space/lab?token=huggingface
+              // Ini bypass form login — tidak perlu ketik token manual
+              console.log(`   🌐 Membuka: ${labUrl}`);
+              await page.goto(labUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+              await sleep(3_000);
 
-            const currentUrl = page.url();
-            const title      = await page.title();
-            console.log(`   📄 URL: ${currentUrl}`);
-            console.log(`   📝 Judul: ${title}`);
+              const currentUrl = page.url();
+              const title      = await page.title();
+              console.log(`   📄 URL: ${currentUrl}`);
+              console.log(`   📝 Judul: ${title}`);
+              await page.screenshot({ path: `debug_opened_${safeId}.png` });
 
-            const safeId = spaceUrl.replace(/https?:\/\//, '').replace(/\W/g, '_');
-            await page.screenshot({ path: `debug_space_opened_${safeId}.png` });
+              // ── 2. Jika masih muncul form login Jupyter (jarang terjadi) ─
+              const pwInput = page.locator(
+                'input[name="password"], input#password_input, input[type="password"]'
+              ).first();
+              const isLoginForm = await pwInput.isVisible({ timeout: 5_000 }).catch(() => false);
 
-            // Cek kalau masih redirect ke HF login (tidak seharusnya terjadi setelah login)
-            if (currentUrl.includes('huggingface.co/login')) {
-              throw new Error('Masih redirect ke HF login — cek email/password');
-            }
-
-            // Cek halaman login JupyterLab (minta Jupyter token)
-            const pwInput = page.locator(
-              'input[name="password"], input#password_input, input[type="password"]'
-            ).first();
-            const isJupyterLogin = await pwInput.isVisible({ timeout: 8000 }).catch(() => false);
-
-            if (isJupyterLogin) {
-              console.log('   🔑 Halaman login JupyterLab → memasukkan token Jupyter...');
-              await pwInput.fill(JUPYTER_TOKEN);
-              await page.locator('button#login_submit, button[type="submit"], .btn-jupyter').first().click();
-              await page.waitForURL(url => !url.toString().includes('/login'), { timeout: 30_000 });
-              await page.waitForTimeout(2000);
-              console.log('   ✅ Login JupyterLab berhasil');
-            } else {
-              console.log('   ℹ️  Tidak ada form login Jupyter (langsung masuk)');
-            }
-
-            return page;
-          }
-
-          async function waitForJupyterLab(page) {
-            await page.waitForSelector(
-              '#jp-main-dock-panel, .jp-Launcher, .jp-NotebookPanel, .jp-LabShell',
-              { timeout: 90_000 }
-            );
-            await page.waitForTimeout(3000);
-          }
-
-          async function openTerminal(page) {
-            // Coba tile Terminal di Launcher
-            const tile = page.locator('.jp-LauncherCard-label').filter({ hasText: 'Terminal' }).first();
-            const tileVisible = await tile.isVisible({ timeout: 6000 }).catch(() => false);
-
-            if (tileVisible) {
-              await tile.click();
-              console.log('   💻 Terminal dibuka via Launcher tile');
-            } else {
-              // Fallback: File → New → Terminal
-              console.log('   🗂️  Coba via menu File → New → Terminal...');
-              await page.locator('.jp-MenuBar-itemLabel').filter({ hasText: 'File' }).click();
-              await page.waitForTimeout(500);
-              await page.locator('.lm-Menu-itemLabel').filter({ hasText: 'New' }).click();
-              await page.waitForTimeout(500);
-              await page.locator('.lm-Menu-itemLabel').filter({ hasText: 'Terminal' }).click();
-              console.log('   💻 Terminal dibuka via menu');
-            }
-
-            await page.waitForSelector('.jp-Terminal-body, .xterm-helper-textarea', { timeout: 30_000 });
-            await page.waitForTimeout(2500);
-            console.log('   ✅ Terminal siap');
-          }
-
-          async function runCommand(page, command) {
-            const termBody = page.locator('.jp-Terminal-body, .xterm-helper-textarea').first();
-            await termBody.click();
-            await page.keyboard.type(command);
-            await page.keyboard.press('Enter');
-            await page.waitForTimeout(8000);
-
-            const output = await page.evaluate(() => {
-              const rows = document.querySelectorAll('.xterm-rows > div');
-              if (rows.length > 0) {
-                return Array.from(rows).map(r => r.innerText || r.textContent || '').join('\n');
+              if (isLoginForm) {
+                console.log('   🔑 Form login Jupyter muncul → isi token...');
+                await pwInput.fill(JUPYTER_TOKEN);
+                await Promise.all([
+                  page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30_000 }),
+                  page.locator('button#login_submit, button[type="submit"], .btn-jupyter').first().click(),
+                ]);
+                console.log('   ✅ Login Jupyter selesai');
+                await sleep(2_000);
               }
-              const body = document.querySelector('.jp-Terminal-body');
-              return body ? (body.innerText || body.textContent || '') : '';
-            });
 
-            return output;
+              // ── 3. Tunggu JupyterLab siap ────────────────────────────────
+              console.log('   ⏳ Menunggu JupyterLab...');
+              await page.waitForSelector(
+                '#jp-main-dock-panel, .jp-Launcher, .jp-LabShell, .jp-NotebookPanel',
+                { timeout: 90_000 }
+              );
+              await sleep(3_000);
+              console.log('   ✅ JupyterLab siap');
+
+              // ── 4. Buka terminal ─────────────────────────────────────────
+              // Coba tile Terminal di Launcher
+              const tile = page.locator('.jp-LauncherCard-label')
+                .filter({ hasText: 'Terminal' }).first();
+              const hasTile = await tile.isVisible({ timeout: 6_000 }).catch(() => false);
+
+              if (hasTile) {
+                await tile.click();
+                console.log('   💻 Terminal dibuka via Launcher');
+              } else {
+                // Fallback: File → New → Terminal
+                console.log('   🗂️  Buka via menu File → New → Terminal...');
+                await page.locator('.jp-MenuBar-itemLabel').filter({ hasText: 'File' }).click();
+                await sleep(400);
+                await page.locator('.lm-Menu-itemLabel').filter({ hasText: 'New' }).click();
+                await sleep(400);
+                await page.locator('.lm-Menu-itemLabel').filter({ hasText: 'Terminal' }).click();
+              }
+
+              await page.waitForSelector(
+                '.jp-Terminal-body, .xterm-helper-textarea',
+                { timeout: 30_000 }
+              );
+              await sleep(2_500);
+              console.log('   ✅ Terminal siap');
+
+              // ── 5. Jalankan perintah ─────────────────────────────────────
+              const termBody = page.locator('.jp-Terminal-body, .xterm-helper-textarea').first();
+              await termBody.click();
+              await page.keyboard.type(COMMAND);
+              await page.keyboard.press('Enter');
+              await sleep(8_000); // tunggu output
+
+              // Baca output xterm.js
+              const output = await page.evaluate(() => {
+                const rows = document.querySelectorAll('.xterm-rows > div');
+                if (rows.length > 0)
+                  return Array.from(rows).map(r => r.innerText || r.textContent || '').join('\n');
+                const body = document.querySelector('.jp-Terminal-body');
+                return body ? (body.innerText || body.textContent || '') : '';
+              });
+
+              console.log('📤 Output:');
+              console.log(output.trim() || '(tidak ada output)');
+
+              await page.screenshot({ path: `done_${safeId}.png` });
+              console.log('✅ Selesai');
+
+            } catch (e) {
+              console.log(`❌ Error: ${e.message}`);
+              await page.screenshot({ path: `error_${safeId}.png`, fullPage: true }).catch(() => {});
+            } finally {
+              await context.close();
+            }
           }
 
           // ─── Main ─────────────────────────────────────────────────────────
 
           (async () => {
-            // Validasi env vars
-            if (!HF_EMAIL || !HF_PASSWORD) {
-              console.error('❌ HF_EMAIL dan HF_PASSWORD harus diset di GitHub Secrets!');
-              process.exit(1);
-            }
+            const username = await getUsername().catch(e => { console.error(`❌ ${e.message}`); process.exit(1); });
+            console.log(`👤 Username: ${username}`);
 
-            let username;
-            try {
-              username = await getUsername();
-              console.log(`👤 Username: ${username}`);
-            } catch (e) {
-              console.error(`❌ Gagal get username: ${e.message}`);
-              process.exit(1);
-            }
-
-            let spaces;
-            try {
-              spaces = await listSpaces(username);
-              console.log(`📋 ${spaces.length} Space ditemukan:`);
-              spaces.forEach(s => console.log(`   - ${s}`));
-            } catch (e) {
-              console.error(`❌ Gagal list spaces: ${e.message}`);
-              process.exit(1);
-            }
+            const spaces = await listSpaces(username).catch(e => { console.error(`❌ ${e.message}`); process.exit(1); });
+            console.log(`📋 ${spaces.length} Space ditemukan:`);
+            spaces.forEach(s => console.log(`   - ${s}`));
 
             const browser = await chromium.launch({
               headless: true,
               args: ['--no-sandbox', '--disable-setuid-sandbox'],
             });
 
-            // Satu context untuk semua Space dalam akun ini
-            // Cookie HF login tersimpan dan dipakai ke semua Space
-            const context = await browser.newContext({
-              // User agent mirip browser biasa agar tidak diblokir
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            });
-
-            // ─── STEP 1: Login ke HuggingFace dulu ───────────────────────
-            try {
-              await loginToHuggingFace(context);
-            } catch (e) {
-              console.error(`❌ Gagal login HF: ${e.message}`);
-              await browser.close();
-              process.exit(1);
-            }
-
-            // ─── STEP 2: Proses setiap Space ─────────────────────────────
             for (const repoId of spaces) {
               console.log(`\n${'='.repeat(50)}`);
               console.log(`🔧 Memproses: ${repoId}`);
 
-              let page;
               try {
-                // Cek & restart Space jika perlu
+                // Restart Space jika belum running
                 const stage = await getStage(repoId);
                 console.log(`   Status awal: ${stage}`);
-
                 if (stage !== 'RUNNING') {
                   console.log('🔄 Me-restart Space...');
                   await restartSpace(repoId);
                   const ok = await waitForRunning(repoId);
                   if (!ok) { console.log('⏰ Timeout. Lewati.'); continue; }
-                  console.log('   ⏳ Menunggu 20 detik agar Space stabil...');
+                  console.log('   ⏳ Tunggu 20 detik agar stabil...');
                   await sleep(20_000);
                 }
 
-                // URL lowercase — wajib untuk HF Space
-                const spaceUrl = `https://${repoId.replace('/', '-').toLowerCase()}.hf.space`;
-
-                // Buka Space (sudah login HF, tinggal handle Jupyter token jika ada)
-                page = await openSpace(context, spaceUrl);
-
-                // Tunggu JupyterLab
-                console.log('   ⏳ Menunggu JupyterLab...');
-                await waitForJupyterLab(page);
-                console.log('   ✅ JupyterLab siap');
-
-                // Buka terminal
-                await openTerminal(page);
-
-                // Jalankan perintah
-                console.log(`   ▶️  Menjalankan: ${COMMAND}`);
-                const output = await runCommand(page, COMMAND);
-                console.log('📤 Output:');
-                console.log(output.trim() || '(tidak ada output)');
-
-                const safeId = repoId.replace('/', '_');
-                await page.screenshot({ path: `done_${safeId}.png` });
-                console.log('✅ Selesai');
+                await processSpace(browser, repoId);
 
               } catch (e) {
                 console.log(`❌ Gagal di ${repoId}: ${e.message}`);
-                if (page) {
-                  const safeId = repoId.replace('/', '_');
-                  await page.screenshot({ path: `error_${safeId}.png`, fullPage: true }).catch(() => {});
-                }
-              } finally {
-                if (page) await page.close().catch(() => {});
               }
             }
 
-            await context.close();
             await browser.close();
             console.log(`\n🎉 Akun ${username} selesai diproses.`);
           })();
@@ -380,10 +250,8 @@ jobs:
 
       - name: Jalankan Playwright - Akun ${{ matrix.account.id }}
         env:
-          HF_TOKEN:    ${{ secrets[matrix.account.hf_token_key] }}
-          HF_EMAIL:    ${{ secrets[matrix.account.hf_email_key] }}
-          HF_PASSWORD: ${{ secrets[matrix.account.hf_password_key] }}
-          COMMAND:     ${{ github.event.inputs.command }}
+          HF_TOKEN:      ${{ secrets[matrix.account.hf_token_key] }}
+          COMMAND:       ${{ github.event.inputs.command }}
           JUPYTER_TOKEN: ${{ github.event.inputs.jupyter_token }}
         run: node run_jupyter.mjs
 
