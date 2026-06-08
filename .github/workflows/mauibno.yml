@@ -84,81 +84,127 @@ jobs:
 
           // ─── Playwright: akses JupyterLab langsung via URL+token ─────────
 
-          async function processSpace(browser, repoId) {
-            // URL lowercase + tambah token langsung di URL → bypass form login
-            const base     = `https://${repoId.replace('/', '-').toLowerCase()}.hf.space`;
-            const labUrl   = `${base}/lab?token=${JUPYTER_TOKEN}`;
-            const safeId   = repoId.replace('/', '_');
+          /**
+           * Cek dan isi form login JupyterLab jika muncul.
+           * Dicoba dua cara: via URL token dan via form manual.
+           */
+          async function handleJupyterLogin(page, safeId) {
+            // Tunggu halaman stabil dulu
+            await sleep(3_000);
 
-            // Context baru per Space (cookie terisolasi)
+            const currentUrl = page.url();
+            const title      = await page.title();
+            console.log(`   📄 URL: ${currentUrl} | Judul: ${title}`);
+            await page.screenshot({ path: `debug_before_login_${safeId}.png` });
+
+            // Cek apakah ada form login (input password Jupyter)
+            const pwSelectors = [
+              'input[name="password"]',
+              'input#password_input',
+              'input[type="password"]',
+            ];
+            const pwInput = page.locator(pwSelectors.join(', ')).first();
+            const isLoginPage = await pwInput.isVisible({ timeout: 10_000 }).catch(() => false);
+
+            if (!isLoginPage) {
+              console.log('   ℹ️  Tidak ada form login → sudah masuk JupyterLab');
+              return;
+            }
+
+            console.log('   🔑 Form login Jupyter ditemukan → isi token...');
+
+            // Kosongkan dulu lalu isi token (hindari isian sebelumnya)
+            await pwInput.click({ clickCount: 3 }); // select all
+            await pwInput.fill(JUPYTER_TOKEN);
+            await sleep(500);
+
+            // Screenshot sesaat sebelum klik login
+            await page.screenshot({ path: `debug_login_filled_${safeId}.png` });
+            console.log(`   ✏️  Token diisi: ${JUPYTER_TOKEN}`);
+
+            // Klik tombol login — coba beberapa selector
+            const btnSelectors = [
+              'button#login_submit',
+              'input[type="submit"]',
+              'button[type="submit"]',
+              '.btn-jupyter',
+              'button:has-text("Log in")',
+              'button:has-text("Login")',
+            ];
+            const loginBtn = page.locator(btnSelectors.join(', ')).first();
+            const btnVisible = await loginBtn.isVisible({ timeout: 5_000 }).catch(() => false);
+
+            if (btnVisible) {
+              // Promise.all: klik & tunggu navigasi bersamaan
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }),
+                loginBtn.click(),
+              ]);
+              console.log('   ✅ Login Jupyter berhasil (klik tombol)');
+            } else {
+              // Fallback: tekan Enter di field password
+              console.log('   ⌨️  Tombol tidak ditemukan, tekan Enter...');
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30_000 }),
+                pwInput.press('Enter'),
+              ]);
+              console.log('   ✅ Login Jupyter berhasil (Enter)');
+            }
+
+            await sleep(3_000);
+            await page.screenshot({ path: `debug_after_login_${safeId}.png` });
+          }
+
+          async function processSpace(browser, repoId) {
+            const base   = `https://${repoId.replace('/', '-').toLowerCase()}.hf.space`;
+            const safeId = repoId.replace('/', '_');
+
             const context = await browser.newContext({
               userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-              extraHTTPHeaders: {
-                // Kirim HF token di setiap request ke hf.space
-                Authorization: `Bearer ${HF_TOKEN}`,
-              },
             });
 
             const page = await context.newPage();
             page.on('console', msg => {
               if (msg.type() === 'error') {
                 const t = msg.text();
-                if (!t.includes('favicon') && !t.includes('.map') && !t.includes('404'))
+                if (!t.includes('favicon') && !t.includes('.map') &&
+                    !t.includes('404') && !t.includes('Connection lost'))
                   console.log(`   [browser] ${t.substring(0, 120)}`);
               }
             });
 
             try {
-              // ── 1. Buka JupyterLab langsung dengan token di URL ──────────
-              // Contoh: https://ones010-fxdgbxdfs.hf.space/lab?token=huggingface
-              // Ini bypass form login — tidak perlu ketik token manual
-              console.log(`   🌐 Membuka: ${labUrl}`);
-              await page.goto(labUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-              await sleep(3_000);
+              // ── 1. Coba buka langsung via URL+token (bypass login jika bisa) ──
+              const labWithToken = `${base}/lab?token=${JUPYTER_TOKEN}`;
+              console.log(`   🌐 Membuka: ${labWithToken}`);
+              await page.goto(labWithToken, { waitUntil: 'domcontentloaded', timeout: 60_000 });
 
-              const currentUrl = page.url();
-              const title      = await page.title();
-              console.log(`   📄 URL: ${currentUrl}`);
-              console.log(`   📝 Judul: ${title}`);
-              await page.screenshot({ path: `debug_opened_${safeId}.png` });
+              // ── 2. Handle form login jika muncul ──────────────────────────
+              await handleJupyterLogin(page, safeId);
 
-              // ── 2. Jika masih muncul form login Jupyter (jarang terjadi) ─
-              const pwInput = page.locator(
-                'input[name="password"], input#password_input, input[type="password"]'
-              ).first();
-              const isLoginForm = await pwInput.isVisible({ timeout: 5_000 }).catch(() => false);
-
-              if (isLoginForm) {
-                console.log('   🔑 Form login Jupyter muncul → isi token...');
-                await pwInput.fill(JUPYTER_TOKEN);
-                await Promise.all([
-                  page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30_000 }),
-                  page.locator('button#login_submit, button[type="submit"], .btn-jupyter').first().click(),
-                ]);
-                console.log('   ✅ Login Jupyter selesai');
-                await sleep(2_000);
+              // Jika URL masih di /login, navigasi manual ke /lab
+              if (page.url().includes('/login')) {
+                console.log('   🔄 Masih di halaman login, coba navigasi ke /lab...');
+                await page.goto(`${base}/lab`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+                await handleJupyterLogin(page, safeId);
               }
 
-              // ── 3. Tunggu JupyterLab siap ────────────────────────────────
+              // ── 3. Tunggu JupyterLab siap ─────────────────────────────────
               console.log('   ⏳ Menunggu JupyterLab...');
               await page.waitForSelector(
                 '#jp-main-dock-panel, .jp-Launcher, .jp-LabShell, .jp-NotebookPanel',
                 { timeout: 90_000 }
               );
-              await sleep(3_000);
+              await sleep(5_000);
               console.log('   ✅ JupyterLab siap');
 
-              // ── 4. Buka terminal ─────────────────────────────────────────
-              // Coba tile Terminal di Launcher
+              // ── 4. Buka terminal ──────────────────────────────────────────
               const tile = page.locator('.jp-LauncherCard-label')
                 .filter({ hasText: 'Terminal' }).first();
-              const hasTile = await tile.isVisible({ timeout: 6_000 }).catch(() => false);
-
-              if (hasTile) {
+              if (await tile.isVisible({ timeout: 6_000 }).catch(() => false)) {
                 await tile.click();
                 console.log('   💻 Terminal dibuka via Launcher');
               } else {
-                // Fallback: File → New → Terminal
                 console.log('   🗂️  Buka via menu File → New → Terminal...');
                 await page.locator('.jp-MenuBar-itemLabel').filter({ hasText: 'File' }).click();
                 await sleep(400);
@@ -171,17 +217,49 @@ jobs:
                 '.jp-Terminal-body, .xterm-helper-textarea',
                 { timeout: 30_000 }
               );
-              await sleep(2_500);
-              console.log('   ✅ Terminal siap');
 
-              // ── 5. Jalankan perintah ─────────────────────────────────────
+              // FIX: tunggu sampai terminal stabil — tidak ada "reconnecting" di terminal
+              // "Connection lost, reconnecting" terjadi karena WebSocket belum siap
+              console.log('   ⏳ Menunggu koneksi terminal stabil...');
+              await page.waitForFunction(() => {
+                const rows = document.querySelectorAll('.xterm-rows > div');
+                const text = Array.from(rows).map(r => r.textContent || '').join('');
+                // Terminal siap jika sudah ada prompt ($ atau # atau ~)
+                // dan tidak sedang "reconnecting"
+                return text.length > 0 && !text.includes('reconnecting');
+              }, { timeout: 60_000, polling: 2_000 }).catch(() => {
+                console.log('   ⚠️  Timeout tunggu prompt, coba lanjut...');
+              });
+
+              await sleep(3_000);
+              console.log('   ✅ Terminal stabil');
+
+              // ── 5. Kirim perintah & ambil output ─────────────────────────
               const termBody = page.locator('.jp-Terminal-body, .xterm-helper-textarea').first();
               await termBody.click();
+
+              // Baca teks terminal sebelum kirim perintah (untuk dibandingkan nanti)
+              const before = await page.evaluate(() => {
+                const rows = document.querySelectorAll('.xterm-rows > div');
+                return Array.from(rows).map(r => r.textContent || '').join('\n');
+              });
+
               await page.keyboard.type(COMMAND);
               await page.keyboard.press('Enter');
-              await sleep(8_000); // tunggu output
 
-              // Baca output xterm.js
+              // Tunggu output baru muncul (bandingkan dengan konten sebelum)
+              console.log(`   ▶️  Perintah dikirim: ${COMMAND}`);
+              await page.waitForFunction((prevText) => {
+                const rows = document.querySelectorAll('.xterm-rows > div');
+                const current = Array.from(rows).map(r => r.textContent || '').join('\n');
+                return current.length > prevText.length;
+              }, before, { timeout: 30_000, polling: 1_000 }).catch(() => {
+                console.log('   ⚠️  Timeout tunggu output, coba baca sekarang...');
+              });
+
+              // Tunggu perintah selesai (prompt kembali muncul)
+              await sleep(5_000);
+
               const output = await page.evaluate(() => {
                 const rows = document.querySelectorAll('.xterm-rows > div');
                 if (rows.length > 0)
