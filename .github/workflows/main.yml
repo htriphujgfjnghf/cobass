@@ -1,4 +1,4 @@
-name: 🔁 Jalankan Perintah di Semua Space (Auto Detect)
+name: 🔁 Jalankan Perintah di Semua Space (Banyak Akun)
 
 on:
   workflow_dispatch:
@@ -9,121 +9,214 @@ on:
         default: 'lscpu'
 
 jobs:
-  run:
+  run-per-account:
+    strategy:
+      matrix:
+        account:
+          - id: "acc1"
+            secret_key: "HF_TOKEN_ACC1"
+            jupyter_token_key: "JUPYTER_TOKEN_ACC1"
+          - id: "acc2"
+            secret_key: "HF_TOKEN_ACC2"
+            jupyter_token_key: "JUPYTER_TOKEN_ACC2"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: pip install huggingface_hub requests websocket-client
 
-      - name: Proses Semua Space
+      - name: Install dependencies
+        run: pip install huggingface_hub requests websocket-client
+
+      - name: Proses Akun ${{ matrix.account.id }}
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets[matrix.account.secret_key] }}
+          JUPYTER_TOKEN: ${{ secrets[matrix.account.jupyter_token_key] }}
           COMMAND: ${{ github.event.inputs.command }}
         shell: python
         run: |
-          import os, time, json, requests, websocket
+          import os, sys, time, json, requests, websocket
           from huggingface_hub import HfApi
 
           HF_TOKEN = os.environ["HF_TOKEN"]
+          JUPYTER_TOKEN = os.environ.get("JUPYTER_TOKEN", "huggingface")
           COMMAND = os.environ["COMMAND"]
-          JUPYTER_TOKEN = "huggingface"   # pastikan Space sudah diatur tanpa token Jupyter
 
           api = HfApi(token=HF_TOKEN)
 
-          # Ambil username dari token
-          user = api.whoami()
-          username = user["name"]
-          print(f"👤 Akun: {username}")
+          # Dapatkan username dari token
+          try:
+              user = api.whoami()
+              username = user["name"]
+              print(f"👤 Username: {username}")
+          except Exception as e:
+              print(f"❌ Gagal mendapatkan username: {e}")
+              sys.exit(1)
 
           # Ambil semua Space
           all_spaces = []
-          for space in api.list_spaces(author=username):
-              all_spaces.append(space.id)   # format "username/nama_space"
-          print(f"📋 Ditemukan {len(all_spaces)} Space:")
+          try:
+              for space in api.list_spaces(author=username):
+                  all_spaces.append(space.id)
+          except Exception as e:
+              print(f"❌ Gagal mengambil daftar Space: {e}")
+              sys.exit(1)
+
+          if not all_spaces:
+              print("📭 Tidak ada Space ditemukan.")
+              sys.exit(0)
+
+          print(f"📋 Space yang akan diproses ({len(all_spaces)}):")
           for s in all_spaces:
               print(f"   - {s}")
 
-          if not all_spaces:
-              print("Tidak ada Space, selesai.")
-              raise SystemExit(0)
+          def build_headers():
+              return {"Authorization": f"Bearer {HF_TOKEN}"}
 
-          # Proses tiap Space
+          def build_terminals_url(space_url):
+              url = f"{space_url}/api/terminals"
+              if JUPYTER_TOKEN:
+                  url += f"?token={JUPYTER_TOKEN}"
+              return url
+
+          def wait_for_jupyterlab(space_url, max_retries=12, wait_sec=10):
+              """
+              Coba akses JupyterLab sampai berhasil.
+              Space bisa berstatus RUNNING tapi JupyterLab masih inisialisasi.
+              """
+              headers = build_headers()
+              terminals_url = build_terminals_url(space_url)
+              for attempt in range(max_retries):
+                  try:
+                      resp = requests.get(
+                          f"{space_url}/api/kernelspecs",
+                          headers=headers,
+                          timeout=15
+                      )
+                      if resp.status_code == 200:
+                          print(f"   ✅ JupyterLab siap (percobaan {attempt + 1})")
+                          return True
+                      else:
+                          print(f"   ⏳ JupyterLab belum siap (HTTP {resp.status_code}), tunggu {wait_sec}s...")
+                  except Exception as e:
+                      print(f"   ⏳ JupyterLab belum bisa diakses ({e}), tunggu {wait_sec}s...")
+                  time.sleep(wait_sec)
+              return False
+
+          def create_terminal(space_url):
+              headers = build_headers()
+              terminals_url = build_terminals_url(space_url)
+              resp = requests.post(terminals_url, headers=headers, timeout=30)
+              if resp.status_code != 200:
+                  raise Exception(f"HTTP {resp.status_code}: {resp.text[:200]}")
+              return resp.json()["name"]
+
+          def run_command_in_terminal(space_url, term_name):
+              ws_url = f"wss://{space_url.replace('https://', '')}/api/terminals/websocket/{term_name}"
+              params = []
+              if JUPYTER_TOKEN:
+                  params.append(f"token={JUPYTER_TOKEN}")
+              params.append(f"authorization=Bearer%20{HF_TOKEN}")
+              if params:
+                  ws_url += "?" + "&".join(params)
+
+              ws = websocket.create_connection(ws_url, timeout=30)
+
+              # Tunggu terminal siap (prompt muncul)
+              time.sleep(3)
+
+              # Kirim perintah
+              ws.send(json.dumps(["stdin", COMMAND + "\n"]))
+
+              # Tunggu output
+              time.sleep(5)
+
+              output = ""
+              ws.settimeout(5)
+              while True:
+                  try:
+                      data = json.loads(ws.recv())
+                      if data[0] == "stdout":
+                          output += data[1]
+                  except websocket.WebSocketTimeoutException:
+                      break
+                  except Exception:
+                      break
+              ws.close()
+              return output
+
+          def delete_terminal(space_url, term_name):
+              headers = build_headers()
+              terminals_url = build_terminals_url(space_url)
+              base_url = terminals_url.split("?")[0]
+              requests.delete(f"{base_url}/{term_name}", headers=headers, timeout=15)
+
+          # Proses setiap Space
           for repo_id in all_spaces:
               print(f"\n{'='*50}")
-              print(f"🔧 {repo_id}")
+              print(f"🔧 Memproses: {repo_id}")
               try:
-                  # 1. Cek status
+                  # 1. Cek status & restart jika tidak running
                   runtime = api.get_space_runtime(repo_id)
                   stage = str(runtime.stage)
-                  print(f"   Status: {stage}")
+                  print(f"   Status awal: {stage}")
 
-                  if stage == "RUNNING":
-                      print("   ⏩ Sudah running, skip.")
-                      continue
-
-                  # 2. Restart + tunggu
-                  print("   🔄 Restart...")
-                  api.restart_space(repo_id)
-                  for i in range(60):
-                      time.sleep(10)
-                      runtime = api.get_space_runtime(repo_id)
-                      stage = str(runtime.stage)
-                      print(f"      -> {stage}")
-                      if stage == "RUNNING":
-                          break
+                  if stage != "RUNNING":
+                      print("🔄 Me-restart Space...")
+                      api.restart_space(repo_id)
+                      space_became_running = False
+                      for attempt in range(60):
+                          time.sleep(10)
+                          runtime = api.get_space_runtime(repo_id)
+                          stage = str(runtime.stage)
+                          print(f"   Status: {stage}")
+                          if stage == "RUNNING":
+                              space_became_running = True
+                              break
+                      if not space_became_running:
+                          print("⏰ Timeout menunggu Space running. Lewati.")
+                          continue
+                      # Tambahan jeda agar proses internal Space stabil
+                      print("   ⏳ Menunggu 20 detik agar Space stabil setelah running...")
+                      time.sleep(20)
                   else:
-                      print("   ⏰ Timeout. Lanjut Space berikutnya.")
+                      # Space sudah running, tetap tunggu sebentar jika baru saja start
+                      print("   Space sudah RUNNING.")
+
+                  # 2. Tunggu JupyterLab benar-benar siap
+                  space_url = f"https://{repo_id.replace('/', '-')}.hf.space"
+                  print(f"   🌐 URL Space: {space_url}")
+
+                  jupyterlab_ready = wait_for_jupyterlab(space_url)
+                  if not jupyterlab_ready:
+                      print(f"⚠️  JupyterLab tidak siap setelah menunggu. Lewati.")
                       continue
 
-                  # 3. Jeda agar JupyterLab siap
-                  print("   ⏳ Menunggu JupyterLab siap (15 detik)...")
-                  time.sleep(15)
-
-                  # 4. Buat terminal
-                  base_url = f"https://{repo_id.replace('/', '-')}.hf.space"
-                  headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-                  resp = requests.post(f"{base_url}/api/terminals", headers=headers)
-                  if resp.status_code != 200:
-                      print(f"   ❌ Gagal buat terminal (HTTP {resp.status_code}). Lanjut.")
-                      continue
-                  term_name = resp.json()["name"]
-                  print(f"   💻 Terminal {term_name} dibuat")
-
-                  # 5. WebSocket (URL benar: /terminals/websocket/<name>)
-                  ws_url = f"wss://{base_url.split('://')[1]}/terminals/websocket/{term_name}"
+                  # 3. Buat terminal
                   try:
-                      ws = websocket.create_connection(
-                          ws_url,
-                          header=headers,
-                          timeout=10
-                      )
-                      ws.send(json.dumps(["stdin", COMMAND + "\n"]))
-                      time.sleep(2)
-                      ws.settimeout(5)
-                      output = ""
-                      for _ in range(10):
-                          try:
-                              data = json.loads(ws.recv())
-                              if data[0] == "stdout":
-                                  output += data[1]
-                          except websocket.WebSocketTimeoutException:
-                              break
-                          except Exception:
-                              break
-                      ws.close()
-                      print("   📤 Output:")
-                      print("   " + (output.strip() or "(kosong)"))
+                      term_name = create_terminal(space_url)
+                      print(f"💻 Terminal dibuat: {term_name}")
                   except Exception as e:
-                      print(f"   ❌ WebSocket error: {e}")
-                  finally:
-                      # Hapus terminal
-                      requests.delete(f"{base_url}/api/terminals/{term_name}", headers=headers)
-                      print("   🧹 Terminal dihapus")
+                      print(f"⚠️  Gagal membuat terminal: {e}. Lewati.")
+                      continue
 
-                  print("   ✅ Selesai")
+                  # 4. Jalankan perintah lewat WebSocket
+                  try:
+                      output = run_command_in_terminal(space_url, term_name)
+                      print("📤 Output:")
+                      print(output.strip() or "(tidak ada output)")
+                  except Exception as e:
+                      print(f"⚠️  Gagal menjalankan perintah: {e}")
+                  finally:
+                      # 5. Hapus terminal (selalu dijalankan)
+                      try:
+                          delete_terminal(space_url, term_name)
+                          print("🗑️  Terminal dihapus.")
+                      except Exception:
+                          pass
+
+                  print("✅ Selesai.\n")
 
               except Exception as e:
-                  print(f"   ❌ Error: {e}")
+                  print(f"❌ Gagal di {repo_id}: {e}")
                   continue
 
-          print(f"\n🎉 Semua Space milik {username} selesai diproses.")
+          print(f"\n🎉 Akun {username} selesai diproses.")
