@@ -15,10 +15,10 @@ jobs:
         account:
           - id: "acc1"
             secret_key: "HF_TOKEN_ACC1"
-            jupyter_token_key: "JUPYTER_TOKEN_ACC1"
+            jupyter_token_key: "huggingface"
           - id: "acc2"
             secret_key: "HF_TOKEN_ACC2"
-            jupyter_token_key: "JUPYTER_TOKEN_ACC2"
+            jupyter_token_key: "huggingface"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +37,7 @@ jobs:
           from huggingface_hub import HfApi
 
           HF_TOKEN = os.environ["HF_TOKEN"]
-          JUPYTER_TOKEN = os.environ.get("JUPYTER_TOKEN", "huggingface")
+          JUPYTER_TOKEN = os.environ.get("huggingface", "huggingface")
           COMMAND = os.environ["COMMAND"]
 
           api = HfApi(token=HF_TOKEN)
