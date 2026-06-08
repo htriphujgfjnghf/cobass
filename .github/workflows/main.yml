@@ -27,7 +27,7 @@ jobs:
 
           api = HfApi(token=HF_TOKEN)
           user = api.whoami()["name"]
-          space_name = "nama-space-kamu"   # GANTI dengan nama Space kamu
+          space_name = "Ones8/ngcdffd"   # GANTI dengan nama Space kamu
           repo_id = f"{user}/{space_name}"
 
           # Cek status & restart jika tidak running
